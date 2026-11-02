@@ -1,4 +1,4 @@
-# CCTV 直播、点播 保护机制详解：视频加密、JS/WASM 虚拟化、环境检查与逆向复盘
+# CCTV 直播、点播 保护机制详解：视频加密、JS/WASM 虚拟化、环境检查与逆向复盘(ios 桌面)
 
 > 分析日期：2026-10-24；本版为机制详解扩充版。本文同时解释“目标程序如何工作”和“我们怎样证明它”，以最终成功解码的结果为准。所有算法结论均限定于本次上传文件和其中的 H.264 加密模式 1。文中的编码端流程是由逆变换验证得到的等价实现，不是服务端源码。
 
@@ -1629,6 +1629,225 @@ new TextDecoder().decode(heap.subarray(ptr, end));
 - [W3C MPEG-2 TS Byte Stream Format](https://www.w3.org/TR/mse-byte-stream-format-mp2t/) 与 [ISO BMFF Byte Stream Format](https://www.w3.org/TR/mse-byte-stream-format-isobmff/)：MSE 场景的容器结构说明，不能把其中子集约束推广为所有 TS/MP4 文件的规则。
 - [RFC 6184](https://www.rfc-editor.org/rfc/rfc6184.html)：H.264 NAL 层及相关术语背景。
 - 用户提供的《ts帧加密案例（一）》原帖 PDF，以及原帖链接；本节只对比文中实际展示的内容。
+# CCTV iOS 直播：原生 HLS、Service Worker 与私有 TS 还原
+
+> 本文记录对一个 CCTV-1 直播页面、iOS Service Worker 相关脚本和一个 TS 样本的分析。重点是解释为什么 `<video>` 直接指向 m3u8，抓到的 TS 却是私有加密数据。文中将静态代码观察、受控实测和尚待验证的推断分开表述。
+
+## 1. 结论和证据边界
+
+在所分析的实现中，Service Worker 具有拦截 HLS 请求、获取网络响应、将 TS 响应体传给 WASM 核心 `_ts_cover`，再构造新 `Response` 返回的能力。Safari 原生 HLS 可以继续持有原来的 m3u8 URL，而实际读到经 Service Worker 处理后的 TS。
+
+对用户提供的 CCTV-1 TS 样本，已做两条独立验证：
+
+1. 直接用 FFmpeg 严格解码原文件时出现 H.264 宏块错误；用此前电脑端直播模式的独立解密脚本处理后，严格解码成功。
+2. 将同一输入送进 iOS 核心模块的 `_ts_cover`，获得可解析、可严格解码的 TS 输出。
+
+**尚未直接验证：**该次 iPhone 播放时具体由哪个 Service Worker 实例控制页面；上传的 TS 是否恰好是 Safari 正在播放的同一个请求的响应；该请求是否实际命中 `_ts_cover`；XP2P 是否获取到了其他节点数据。静态代码与离线实测给出了可行机制，但这些设备侧事实仍需日志或抓包确认。
+
+另一个未解决现象是：手动请求子 m3u8 时仍返回四个码率的主列表。本次没有验证根因，也没有证据证明 XP2P 或 SW 把子列表改成了主列表。
+
+## 2. 页面现象：为什么看上去是原生播放
+
+用户提供的 iOS 页面 DOM 中：
+
+```html
+<video id="h5player_player"
+  src="https://ldncctvwbcdks.v.kcdnvip.com/ldncctvwbcd/cdrmldcctv1_1/index.m3u8?b=200-2100"
+  playsinline controls></video>
+```
+
+用户提供的两次运行状态显示 `src` 和 `currentSrc` 均为该 m3u8 URL，`currentTime` 从约 10.94 秒增长到约 33.22 秒，`paused: false`，`readyState: 4`，`error: null`。这与原生 HLS 路径相符；若结合用户观察到的正常画面，支持播放器正在正常播放。
+
+与电脑端先前看到的 `blob:` 媒体源不同，**原生 HLS 并不要求 JS 用 MSE 的 `appendBuffer()` 喂数据**。Safari 可以自己处理 HLS 播放列表和受支持的媒体分片。
+
+不过，Safari 并不会自动理解此前逆向出的私有 TEA 视频扰动：必须另有数据还原环节。这里的关键是 Service Worker 返回的响应体可以与 CDN 的原始响应体不同，`video.currentSrc` 不因此改变。
+
+## 3. 组件分工
+
+本次取得的三个脚本共同构成所观察到的 iOS 侧实现：
+
+| 文件 | 观察到的角色 |
+| --- | --- |
+| `ios.cdrm.sw.base.js` | Service Worker 入口：注册事件、判断请求、组织网络与 P2P 路径、调用 TS 处理并返回响应 |
+| `ios.cdrm.sw.core.js` | Emscripten 风格 JS 胶水及内嵌 WASM，提供 `CNTVSwModule` 和 `_ts_cover` |
+| `ios.cdrm.sw.xp2p.js` | XP2P 的 Service Worker 侧协作代码，将播放列表和分片请求与页面侧组件关联 |
+
+`base.js` 的版本字符串和另外两个脚本的 URL 指向 `cctv_sw_ver[260825.1310]`、`core=2026`。这里仅是本次取得的构建标记，不能据此推断所有线上环境都在运行同一版本。
+
+## 4. Service Worker 如何介入原生 HLS
+
+### 4.1 页面控制与拦截边界
+
+Service Worker 需要先注册，当前页面需受到该实例控制。注册 scope 指定哪些页面能够受控，不是资源 URL 必须落在这个 scope 路径下。受控页面加载媒体时，相关请求是否触发 SW 还受浏览器实现及请求场景影响；跨域响应能否被读取并构造新响应，还取决于 CORS、响应类型等条件。
+
+SW 脚本路径位于 `/Library/`，但不能由此断定它能控制 `/live/...` 页面：实际 scope、注册参数和 `Service-Worker-Allowed` 等响应头都需要核实。
+
+查看当前页面是否受控：
+
+```js
+console.log('controller:', navigator.serviceWorker.controller?.scriptURL);
+
+navigator.serviceWorker.getRegistrations().then(registrations => {
+  console.table(registrations.map(r => ({
+    scope: r.scope,
+    active: r.active?.scriptURL,
+    waiting: r.waiting?.scriptURL,
+    installing: r.installing?.scriptURL
+  })));
+});
+```
+
+`controller` 为 `null` 时，不能仅凭存在 registration 就断言当前页面已经受控。反之，controller 指向目标脚本，也仍需动态确认具体媒体请求命中处理分支。
+
+### 4.2 事件与响应替换
+
+base 脚本注册了 `install`、`activate`、`message` 和 `fetch`；安装时调用 `skipWaiting()`，激活时调用 `clients.claim()`。它为 `.ts` 与 `.m3u8` 路径设置匹配条件，并在符合分支时对请求使用 `event.respondWith(...)`。
+
+流程概念上如下：
+
+```text
+Safari 原生 HLS 请求
+        ↓
+受控页面关联的 fetch 事件
+        ↓
+base 判断请求 / XP2P 路径
+        ↓
+取得源响应
+        ↓
+普通 TS 且满足处理条件 → _ts_cover
+        ↓
+构造 Response 返回媒体引擎
+```
+
+这不修改系统代理，也不要求改变 `<video>` 的 URL。抓包工具若观察网络侧 CDN 响应，可以看到处理前的密文；播放器消费的可能是 SW 新构造的响应。具体抓包工具能看到哪个层次，取决于其抓包位置。
+
+## 5. base：从 TS 响应到 `_ts_cover`
+
+base 中的处理逻辑在阅读响应成功且有 body 时，读取响应流并拼接字节，随后在条件满足时调用内部 TS 处理包装函数。该包装函数检查输入和模块状态，把数据写进 WASM 内存，调用 `_ts_cover`，从内存取回输出，最后释放内存。
+
+下列是按照实际调用关系整理的**等价示意**，不是原始源码逐字还原：
+
+```js
+function transformTs(input, module) {
+  if (!(input instanceof Uint8Array) || input.byteLength === 0) return input;
+  if (!module || typeof module._malloc !== 'function') return input;
+
+  const ptr = module._malloc(input.byteLength + 1048576);
+  if (!ptr) return input;
+  try {
+    module.HEAP8.set(input, ptr);
+    if (typeof module._ts_cover !== 'function') return input;
+    const outputLength = module._ts_cover(ptr, input.byteLength, 1);
+    if (outputLength <= 0) return input;
+    return new Uint8Array(module.HEAP8.slice(ptr, ptr + outputLength));
+  } finally {
+    module._free(ptr);
+  }
+}
+```
+
+可以确认的参数含义是：第一个参数为缓冲区指针，第二个是输入字节数，第三个传入常量 `1`；返回值用于确定输出长度。**第三个参数的语义还未完成逆向，不应直接命名为解密开关或算法版本。**
+
+在这些检查失败、函数返回非正值或捕获到异常的情况下，包装函数有回退原输入的路径，因此看到函数被调用不等于一定成功还原；应核对返回长度、错误日志和输出。
+
+原脚本之后调用 `new Response(...)` 包装处理结果，并为字节数组更新 `Content-Length`。涉及内部 XP2P 请求或 URL 中 `xfrom` 参数时，有不同处理分支，不能简单说所有 `.ts` 都会无条件执行 `_ts_cover`。
+
+## 6. WASM 载荷与电脑端对比
+
+`ios.cdrm.sw.core.js` 包含 `data:application/octet-stream;base64,...`，其中解码得到 iOS WASM。JS 层将 `_ts_cover` 映射到该构建 WASM 的 `ob` 导出。`ob` 是此构建的短名称，**不应当作跨版本稳定接口**。
+
+| 对比项 | 此前电脑端 WASM | 本次 iOS 核心 WASM |
+| --- | ---: | ---: |
+| 字节数 | 92,626 | 1,374,779 |
+| SHA-256 | `f94a1562f39764f8c538ec26e1259579f179d77dfc027010b64526a7a2157a69` | `173b07c573ea75935e89e690184749913bec5603086f9c955777f1ce1dfd5fb3` |
+| WASM 导出项 | 39 | 47 |
+| WASM 导入项总数 | 59 | 114 |
+| 此前识别的调用粒度 | 视频 NAL 及上下文 | `_ts_cover` 输入完整 TS 分片 |
+
+结论是二进制不同，且接口职责存在区别。两者能处理同一直播样本，不足以证明底层源码完全相同。文件大小、导入导出项数量也不能直接说明源码复杂度或逐项功能。
+
+## 7. XP2P：请求协作与来源边界
+
+`ios.cdrm.sw.xp2p.js` 文件头有 Tencent Cloud 版权声明。由此可以认定该文件**声明为腾讯云组件**；不能进一步推定 CCTV 的加密算法、WASM 混淆器或整个播放器均由腾讯开发。
+
+base 中创建 `XP2PSW.XP2PSWLib.create()`，并可调用 `detectXP2PRequest()` 和 `match()`。XP2P 模块：
+
+- 对直播 m3u8 发起网络请求，读取响应副本，通过消息通道把 URL 和文本同步给页面侧；其中 `http://sw.xp2p/hls/sync/m3u8` 是内部消息使用的 URL 字符串，不能仅凭此认定发生了对外网络访问。
+- 对部分 TS 请求向页面侧发送查询，内部标识为 `http://sw.xp2p/hls/request/ts`；拿到数据后可用 `video/mp2t` 的 `Response` 返回。
+- 使用 `postMessage` 和内部 stream 标识、序号及请求/响应消息组织页面与 SW 的通信。
+- 内部请求可带 `xfrom` 参数，代码会识别并清理该参数；base 也会依据请求性质决定是否执行后续 TS 处理。
+- 匹配失败时，base 存在回退到网络请求的路径。
+
+这个文件未发现 `_ts_cover` 等 TS 解密核心；它更侧重数据获取与分发。是否真的发生设备间传输、是否使用浏览器对等连接，以及某次分片来自缓存、CDN 还是对端，均不能只凭 SW 侧文件确认。对应的页面侧 XP2P 组件和实时日志需要另查。
+
+XP2P 文件包含可选腾讯云日志上传地址，但 base 初始化时设置 `enableUpload: false`。这只能说明所见初始化参数禁用上传，不能推断所有版本和后续状态。
+
+## 8. 样本与验证
+
+输入文件：`cdrmldcctv1_1_1800-1793286469.ts.bin`
+
+```text
+输入大小：1,145,860 字节
+输入 SHA-256：c29d9e5962d9a24d3ab60f999a9fa68a0d362144c0a95444a55297cdc5da1762
+封装：MPEG-TS，188 字节包
+视频：PID 0x100，H.264，1280×720
+音频：PID 0x101，AAC
+```
+
+原文件通过 ffprobe 可识别流，但 FFmpeg 严格解码出现宏块、参考帧等错误。使用此前直播模式脚本识别为 mode 1，共处理 102 个视频 slice，输出能够严格解码。
+
+独立运行 iOS 模块：从 `ios.cdrm.sw.core.js` 加载模块，在 Node 的隔离上下文中模拟必要的浏览器接口与域名环境、补充初始化用的测试响应，将上述完整 TS 写入 WASM 内存，执行：
+
+```js
+const outputLength = module._ts_cover(ptr, input.length, 1);
+```
+
+输出：
+
+```text
+输出大小：1,144,920 字节
+输出 SHA-256：39a5fdd21aa47d07ffcd78fbde495f86740f6f53690b1e5db8e2232652426443
+严格完整解码：成功，退出码 0，无错误输出
+```
+
+验证命令：
+
+```bash
+ffmpeg -v error -xerror -err_detect explode -i swcore-result.ts -f null -
+```
+
+输出比输入少 940 字节，即 5 个 TS 包的长度；这只是文件长度差，**不能仅凭差值断定删除的是哪些包或原因**。iOS 核心输出与此前 Python 脚本的 TS 输出哈希不同，说明两份完整 TS 不是逐字节相同；两者可以解码也不等于证明每一帧、每个音频采样均逐字节一致。
+
+独立运行使用了模拟环境和初始化响应，不是对真实 iPhone 浏览器的端到端复现；它证明该核心模块可处理该样本，并不单独证明用户当时实际走过该模块。
+
+## 9. 与主列表 / 子列表的问题如何对应
+
+用户给出的入口 m3u8 有四条 `#EXT-X-STREAM-INF`，分别是 1800、1350、900 和 600 kbps。这是**主播放列表**；Safari 要选取某个子 URL，并取得含 `#EXTINF` 与媒体分片的列表。
+
+曾观察到手动跟进子 URL 仍得到主列表。SW 脚本确实能够接管 `.m3u8` 请求，XP2P 代码也会同步直播列表到页面侧；但当前没有证据证明它们把子列表替换成了主列表，也没有完成对应请求的真实来源、重定向和缓存键核对。
+
+要解决此问题，应记录**一次正常播放期间**：入口和实际子列表的完整 URL、大小写及全部参数、状态码与 `Location`、请求头、响应体、最终 TS URL，以及相关 SW 控制状态。不要把另一次手动请求的响应直接当成 Safari 当时收到的响应。
+
+## 10. 可复查的构建指纹
+
+以下为本次取得文件的本地 SHA-256；用于后续判断 CDN 文件是否发生变更，不应当作厂商官方校验值：
+
+```text
+base JS  e986edd1b1d30cfca28bc27e09d3d363b5ea10b48c7897d294a8754a15bdb150
+core JS  7fcd0373e9ee225a846b1dff6502c5a0163402fb342fac26e0c523ff79f890d5
+core WASM 173b07c573ea75935e89e690184749913bec5603086f9c955777f1ce1dfd5fb3
+XP2P JS  1b767b74912bafab86813d8f08aed51d58dc22950fbff767076ab041785bf1f6
+```
+
+原文件 URL：
+
+- `https://tv.cctv.cn/Library/ios.cdrm.sw.base.js`
+- `https://js.player.cntv.cn/creator/ios.cdrm.sw.core.js?v=cctv_sw_ver%5B260825.1310%5D&core=2026`
+- `https://js.player.cntv.cn/creator/ios.cdrm.sw.xp2p.js?v=cctv_sw_ver%5B260825.1310%5D&core=2026`
+
+远程脚本可能更新、下线或按环境返回不同内容；后续复核以文件哈希为准。
+<br>
+<br>
 # 点播
 # CCTV 点播 3.bin：与直播分支的差异及可复现还原
 
